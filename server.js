@@ -1,42 +1,63 @@
-const express = require('express');
-const axios = require('axios');
-const path = require('path');
-const app = express();
+const express = require('axios');
+const expressApp = require('express');
+const app = expressApp();
 
-// Render automatically assigns a port via environment variables, otherwise default to 3000 locally
 const PORT = process.env.PORT || 3000;
 
-// Endpoint to serve the dynamic stream configuration JSON file
+// Middleware to parse incoming JSON payloads from your automated checker script
+app.use(expressApp.json());
+
+// In-memory storage for the active stream URL (updates dynamically without manual code pushes)
+let currentStreamConfig = {
+    streamUrl: "https://example.com/placeholder-stream"
+};
+
+// 1. Frontend talks to this to find out what URL to play
 app.get('/config', (req, res) => {
-    res.sendFile(path.join(__dirname, 'stream-config.json'));
+    res.json(currentStreamConfig);
 });
 
-// Route that your Tactical Vibe Machine will talk to
-app.get('/proxy-stream', async (req, res) => {
+// 2. Your automated background script talks to this to push new stream URLs
+app.post('/update-stream', (req, res) => {
+    const { newUrl, secretKey } = req.body;
+
+    // Optional safety check: simple password token so only your script can change it
+    if (secretKey !== process.env.UPDATE_SECRET) {
+        return res.status(403).send('Unauthorized');
+    }
+
+    if (!newUrl) {
+        return res.status(400).send('Missing newUrl');
+    }
+
+    currentStreamConfig.streamUrl = newUrl;
+    console.log(`Stream automatically updated to: ${newUrl}`);
+
+    res.status(200).json({ success: true, updatedUrl: newUrl });
+});
+
+// 3. Your proxy route that feeds clean audio to the Tactical Vibe Machine
+app.get('/proxy-stream', async (expressReq, expressRes) => {
     try {
-        const targetUrl = req.query.url;
-        if (!targetUrl) {
-            return res.status(400).send('Missing target URL. Use ?url=YOUR_STREAM_URL');
+        const targetUrl = currentStreamConfig.streamUrl;
+        if (!targetUrl || targetUrl.includes('placeholder')) {
+            return expressRes.status(400).send('No active stream configured yet.');
         }
 
-        // Fetch the audio stream with responseType 'stream'
         const response = await axios({
             method: 'get',
             url: targetUrl,
             responseType: 'stream',
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' // Mimic a browser so the source doesn't block us
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
             }
         });
 
-        // Set the appropriate audio headers for your browser player
-        res.setHeader('Content-Type', response.headers['content-type'] || 'audio/mpeg');
-
-        // Pipe the incoming audio data directly to your frontend client
-        response.data.pipe(res);
+        expressRes.setHeader('Content-Type', response.headers['content-type'] || 'audio/mpeg');
+        response.data.pipe(expressRes);
     } catch (error) {
         console.error('Proxy error:', error.message);
-        res.status(500).send('Failed to fetch stream');
+        expressRes.status(500).send('Failed to fetch stream');
     }
 });
 
