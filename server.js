@@ -36,6 +36,14 @@ app.post('/update-stream', (req, res) => {
     res.status(200).json({ success: true, updatedUrl: newUrl });
 });
 
+// Allow cross-origin requests from your frontend
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*'); // Or replace '*' with your exact frontend URL
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    next();
+});
+
 // 3. Your proxy route that feeds clean audio to the Tactical Vibe Machine
 app.get('/proxy-stream', async (expressReq, expressRes) => {
     try {
