@@ -1,9 +1,15 @@
 const express = require('express');
 const axios = require('axios');
+const path = require('path');
 const app = express();
 
 // Render automatically assigns a port via environment variables, otherwise default to 3000 locally
 const PORT = process.env.PORT || 3000;
+
+// Endpoint to serve the dynamic stream configuration JSON file
+app.get('/config', (req, res) => {
+    res.sendFile(path.join(__dirname, 'stream-config.json'));
+});
 
 // Route that your Tactical Vibe Machine will talk to
 app.get('/proxy-stream', async (req, res) => {
