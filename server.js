@@ -1,26 +1,24 @@
 const express = require('express');
 const axios = require('axios');
-const { randomUUID } = require('node:crypto');
+const { randomUUID, timingSafeEqual } = require('node:crypto');
 const { pipeline } = require('node:stream/promises');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const RESOURCE_TTL_MS = 30 * 60 * 1000;
 const MAX_PLAYLIST_BYTES = 1024 * 1024;
+const MAX_RESOURCES = 5000;
 
 app.set('trust proxy', 1);
-app.use(express.json({ limit: '10kb' }));
+app.use(express.json({ limit: '64kb' }));
 
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header(
         'Access-Control-Allow-Headers',
-        'Origin, X-Requested-With, Content-Type, Accept, Range'
+        'Origin, Content-Type, Accept, Range, Authorization'
     );
-    res.header(
-        'Access-Control-Allow-Methods',
-        'GET, HEAD, POST, OPTIONS'
-    );
+    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.header(
         'Access-Control-Expose-Headers',
         'Content-Length, Content-Range, Accept-Ranges'
@@ -39,19 +37,15 @@ const allowedHosts = (process.env.STREAM_ALLOWED_HOSTS || '')
     .filter(Boolean);
 
 let currentStreamUrl = process.env.INITIAL_STREAM_URL || '';
-
-// Resource IDs map to upstream playlist/segment URLs. They expire automatically.
+let cookiesByOrigin = new Map();
 const resources = new Map();
 
 function validateUpstreamUrl(value) {
-    let url;
-
-    try {
-        url = new URL(value);
-    } catch {
-        throw new Error('Invalid stream URL');
+    if (typeof value !== 'string' || value.length > 8192) {
+        throw new Error('Invalid URL');
     }
 
+    const url = new URL(value);
     const hostname = url.hostname.toLowerCase();
     const hostAllowed = allowedHosts.some(
         (host) => hostname === host || hostname.endsWith(`.${host}`)
@@ -64,7 +58,7 @@ function validateUpstreamUrl(value) {
         url.port ||
         !hostAllowed
     ) {
-        throw new Error('Stream URL host is not allowed');
+        throw new Error('Unapproved URL');
     }
 
     return url;
@@ -78,7 +72,7 @@ function publicBaseUrl(req) {
 }
 
 function createProxyUrl(req, upstreamUrl) {
-    const validatedUrl = validateUpstreamUrl(upstreamUrl);
+    const url = validateUpstreamUrl(upstreamUrl);
     const now = Date.now();
 
     for (const [id, resource] of resources) {
@@ -87,29 +81,55 @@ function createProxyUrl(req, upstreamUrl) {
         }
     }
 
+    while (resources.size >= MAX_RESOURCES) {
+        resources.delete(resources.keys().next().value);
+    }
+
     const id = randomUUID();
     resources.set(id, {
-        url: validatedUrl.href,
+        url: url.href,
         expiresAt: now + RESOURCE_TTL_MS
     });
 
     return new URL(`/hls-resource/${id}`, publicBaseUrl(req)).href;
 }
 
+function isAuthorized(req) {
+    const secret = process.env.UPDATE_SECRET;
+    const authorization = req.get('authorization') || '';
+
+    if (!secret || !authorization.startsWith('Bearer ')) {
+        return false;
+    }
+
+    const received = Buffer.from(authorization.slice(7));
+    const expected = Buffer.from(secret);
+
+    return received.length === expected.length &&
+        timingSafeEqual(received, expected);
+}
+
 async function fetchUpstream(startUrl, requestHeaders = {}) {
     let currentUrl = validateUpstreamUrl(startUrl).href;
 
     for (let redirects = 0; redirects <= 5; redirects += 1) {
+        const url = validateUpstreamUrl(currentUrl);
+        const headers = {
+            'User-Agent': 'Mozilla/5.0',
+            ...requestHeaders
+        };
+        const cookie = cookiesByOrigin.get(url.origin);
+
+        if (cookie) {
+            headers.Cookie = cookie;
+        }
+
         const response = await axios.get(currentUrl, {
             responseType: 'stream',
             timeout: 30000,
             maxRedirects: 0,
-            decompress: false,
             validateStatus: () => true,
-            headers: {
-                'User-Agent': 'Mozilla/5.0',
-                ...requestHeaders
-            }
+            headers
         });
 
         const location = response.headers.location;
@@ -119,7 +139,7 @@ async function fetchUpstream(startUrl, requestHeaders = {}) {
             response.data.destroy();
 
             if (redirects === 5) {
-                throw new Error('Too many upstream redirects');
+                throw new Error('Too many redirects');
             }
 
             currentUrl = validateUpstreamUrl(
@@ -159,19 +179,22 @@ function isPlaylist(contentType, url) {
 
 function rewritePlaylist(text, baseUrl, req) {
     return text.split(/\r?\n/).map((line) => {
-        if (line.trim() === '') {
+        if (!line.trim()) {
             return line;
         }
 
         if (line.startsWith('#')) {
-            return line.replace(/URI="([^"]+)"/g, (_match, uri) => {
+            return line.replace(/URI="([^"]+)"/g, (match, uri) => {
+                if (/^data:/i.test(uri)) {
+                    return match;
+                }
+
                 const upstreamUrl = new URL(uri, baseUrl).href;
                 return `URI="${createProxyUrl(req, upstreamUrl)}"`;
             });
         }
 
-        const upstreamUrl = new URL(line.trim(), baseUrl).href;
-        return createProxyUrl(req, upstreamUrl);
+        return createProxyUrl(req, new URL(line.trim(), baseUrl).href);
     }).join('\n');
 }
 
@@ -206,11 +229,9 @@ async function serveUpstream(req, res, upstreamUrl) {
 
         for (const header of [
             'content-type',
-            'content-length',
             'content-range',
             'accept-ranges',
-            'cache-control',
-            'content-encoding'
+            'cache-control'
         ]) {
             if (response.headers[header]) {
                 res.setHeader(header, response.headers[header]);
@@ -218,8 +239,8 @@ async function serveUpstream(req, res, upstreamUrl) {
         }
 
         await pipeline(response.data, res);
-    } catch {
-        console.error('Upstream proxy request failed');
+    } catch (error) {
+        console.error('Upstream proxy request failed:', error.name || 'Error');
 
         if (res.headersSent) {
             res.destroy();
@@ -229,6 +250,10 @@ async function serveUpstream(req, res, upstreamUrl) {
     }
 }
 
+app.get('/healthz', (_req, res) => {
+    res.json({ ok: true });
+});
+
 app.get('/config', (req, res) => {
     res.json({
         streamUrl: new URL('/proxy-stream', publicBaseUrl(req)).href
@@ -236,11 +261,7 @@ app.get('/config', (req, res) => {
 });
 
 app.post('/update-stream', (req, res) => {
-    if (!process.env.UPDATE_SECRET) {
-        return res.status(503).send('UPDATE_SECRET is not configured');
-    }
-
-    if (req.body.secretKey !== process.env.UPDATE_SECRET) {
+    if (!isAuthorized(req)) {
         return res.status(403).send('Unauthorized');
     }
 
@@ -249,10 +270,44 @@ app.post('/update-stream', (req, res) => {
     }
 
     try {
-        currentStreamUrl = validateUpstreamUrl(req.body.newUrl).href;
-        return res.status(200).json({ success: true });
+        const streamUrl = validateUpstreamUrl(req.body?.newUrl).href;
+        const updatedCookies = new Map();
+
+        if (req.body.cookies !== undefined) {
+            if (
+                !req.body.cookies ||
+                typeof req.body.cookies !== 'object' ||
+                Array.isArray(req.body.cookies)
+            ) {
+                return res.status(400).send('Invalid cookies');
+            }
+
+            for (const [originValue, cookie] of Object.entries(req.body.cookies)) {
+                const originUrl = new URL(originValue);
+
+                if (
+                    originUrl.protocol !== 'https:' ||
+                    originUrl.origin !== originValue ||
+                    !allowedHosts.some((host) =>
+                        originUrl.hostname === host ||
+                        originUrl.hostname.endsWith(`.${host}`)
+                    ) ||
+                    typeof cookie !== 'string' ||
+                    cookie.length > 16000 ||
+                    /[\r\n]/.test(cookie)
+                ) {
+                    return res.status(400).send('Invalid cookie entry');
+                }
+
+                updatedCookies.set(originUrl.origin, cookie);
+            }
+        }
+
+        currentStreamUrl = streamUrl;
+        cookiesByOrigin = updatedCookies;
+        return res.json({ success: true });
     } catch {
-        return res.status(400).send('Invalid or unapproved stream URL');
+        return res.status(400).send('Invalid or unapproved stream update');
     }
 });
 
